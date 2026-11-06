@@ -1,0 +1,13 @@
+.venv/
+.ex1-tools/
+.ex1-cache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+.env
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
