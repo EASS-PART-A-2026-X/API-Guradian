@@ -4,14 +4,40 @@ from contextlib import asynccontextmanager
 from pathlib import Path as FilePath
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Path, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Path, Request, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy import delete, update
+from sqlalchemy.engine import Engine
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.projects import ApiProject, ProjectInput, ProjectRead
 
 DEFAULT_DATABASE_URL = "sqlite:///data/api_guardian.db"
 ProjectId = Annotated[int, Path(ge=1, le=2**63 - 1)]
+
+
+def initialize_database(engine: Engine) -> None:
+    with engine.begin() as connection:
+        # SQLite needs an explicit transaction for atomic DDL. The write lock
+        # also prevents another startup from migrating the same table.
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        schema = connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'api_projects'"
+        ).scalar_one_or_none()
+        if schema is None or "AUTOINCREMENT" in schema.upper():
+            SQLModel.metadata.create_all(connection)
+            return
+
+        connection.exec_driver_sql(
+            "ALTER TABLE api_projects RENAME TO api_projects_old"
+        )
+        SQLModel.metadata.create_all(connection)
+        connection.exec_driver_sql(
+            "INSERT INTO api_projects (id, name, base_url, description) "
+            "SELECT id, name, base_url, description FROM api_projects_old"
+        )
+        connection.exec_driver_sql("DROP TABLE api_projects_old")
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -24,12 +50,25 @@ def create_app(database_url: str | None = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         FilePath(engine.url.database).parent.mkdir(parents=True, exist_ok=True)
         try:
-            SQLModel.metadata.create_all(engine)
+            initialize_database(engine)
             yield
         finally:
             engine.dispose()
 
     app = FastAPI(title="API Guardian", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def redact_base_url_errors(
+        request: Request, exc: RequestValidationError
+    ) -> Response:
+        errors = [error.copy() for error in exc.errors()]
+        for error in errors:
+            location = tuple(error["loc"])
+            if location == ("body",) or location[:2] == ("body", "base_url"):
+                error.pop("input", None)
+        return await request_validation_exception_handler(
+            request, RequestValidationError(errors)
+        )
 
     def get_session() -> Iterator[Session]:
         with Session(engine) as session:

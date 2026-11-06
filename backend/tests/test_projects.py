@@ -1,5 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
+from sqlmodel import create_engine
 
 from app.main import create_app
 
@@ -73,6 +74,24 @@ def test_invalid_create_does_not_save(client, invalid_fields):
     assert client.get("/projects").json() == []
 
 
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_url_validation_does_not_echo_credentials(client, method):
+    path = "/projects"
+    if method == "PUT":
+        project = client.post(path, json=PROJECT).json()
+        path = f"{path}/{project['id']}"
+
+    secret = "synthetic-secret-token"
+    response = client.request(
+        method, path, json={**PROJECT, "base_url": f"https://user:{secret}@example.com"}
+    )
+    assert response.status_code == 422
+    assert secret not in response.text
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "base_url"]
+    assert "must not include credentials" in error["msg"]
+
+
 def test_invalid_update_leaves_project_intact(client):
     project = client.post("/projects", json=PROJECT).json()
     path = f"/projects/{project['id']}"
@@ -108,3 +127,32 @@ def test_writes_survive_restarting_the_app(database_url):
         assert restarted.get(retained_path).json() == updated.json()
         assert restarted.get(removed_path).status_code == 404
         assert restarted.get("/projects").json() == [updated.json()]
+        replacement = restarted.post("/projects", json=PROJECT)
+        assert replacement.status_code == 201
+        assert replacement.json()["id"] > removed.json()["id"]
+        assert restarted.get(removed_path).status_code == 404
+
+
+def test_legacy_database_preserves_records_and_stops_reusing_ids(tmp_path):
+    url = f"sqlite:///{(tmp_path / 'legacy.db').as_posix()}"
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE api_projects (id INTEGER NOT NULL PRIMARY KEY, "
+            "name VARCHAR NOT NULL, base_url VARCHAR NOT NULL, description VARCHAR)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO api_projects (id, name, base_url, description) VALUES (?, ?, ?, ?)",
+            (7, PROJECT["name"], PROJECT["base_url"], PROJECT["description"]),
+        )
+    engine.dispose()
+
+    with TestClient(create_app(url)) as client:
+        assert client.get("/projects/7").json() == {"id": 7, **PROJECT}
+        assert client.delete("/projects/7").status_code == 204
+
+    with TestClient(create_app(url)) as restarted:
+        created = restarted.post("/projects", json=PROJECT)
+        assert created.status_code == 201
+        assert created.json()["id"] > 7
+        assert restarted.get("/projects/7").status_code == 404

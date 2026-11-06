@@ -45,6 +45,7 @@ class ProjectRead(BaseModel):
 
 class ApiProject(SQLModel, table=True):
     __tablename__ = "api_projects"
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: int | None = Field(default=None, primary_key=True)
     name: str
